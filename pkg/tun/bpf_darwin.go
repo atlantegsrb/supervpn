@@ -35,6 +35,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,7 +46,16 @@ import (
 	"github.com/atlanteg/supervpn/internal/bridge"
 )
 
-const bpfDedupTTL = 300 * time.Millisecond
+const (
+	bpfDedupTTL = 300 * time.Millisecond
+	// hubMACTTL is how long a source MAC seen in an injected (hub→local) frame is
+	// remembered as "this station lives behind the hub". Matches the server hub's
+	// MAC table TTL so the two views expire together.
+	hubMACTTL = 5 * time.Minute
+	// hubSweepInterval bounds how often the hubMACs map is scanned for expiry;
+	// WriteFrame is on the hot path, so the scan must not run per frame.
+	hubSweepInterval = time.Second
+)
 
 type darwinBPF struct {
 	fd      int
@@ -56,6 +66,19 @@ type darwinBPF struct {
 	dedupMu   sync.Mutex
 	dedupMap  map[uint64]time.Time // frame hash → time injected
 	dedupDrops atomic.Uint64       // total frames dropped by dedup
+
+	// localMAC is the bound NIC's own hardware address. Frames the Mac's kernel
+	// sends carry it as source and MUST reach the hub (that is why SEESENT is on),
+	// so it is never treated as a hub-side station.
+	localMAC [6]byte
+	hubMu    sync.Mutex
+	// hubMACs holds source MACs observed in frames we injected from the hub.
+	// Those stations are, by definition, NOT on the local segment — so a frame
+	// read back with such a source MAC can only be our own injection echoing via
+	// SEESENT/TX-loopback. See loopSeen.
+	hubMACs      map[[6]byte]time.Time
+	lastHubSweep time.Time
+	loopDrops    atomic.Uint64
 }
 
 // openBPF opens a BPF device bound to ifaceName for L2 Ethernet capture/inject.
@@ -116,12 +139,23 @@ func openBPF(ifaceName string) (*darwinBPF, error) {
 		return nil, fmt.Errorf("bpf/darwin: BIOCGBLEN: %w", errno)
 	}
 
-	return &darwinBPF{
+	b := &darwinBPF{
 		fd:       fd,
 		iface:    ifaceName,
 		bufSize:  int(bufLen),
 		dedupMap: make(map[uint64]time.Time),
-	}, nil
+		hubMACs:  make(map[[6]byte]time.Time),
+	}
+	// The NIC's own MAC identifies frames sent by this Mac's kernel, which must be
+	// forwarded to the hub rather than treated as loop echoes.
+	if ni, err := net.InterfaceByName(ifaceName); err == nil && len(ni.HardwareAddr) >= 6 {
+		copy(b.localMAC[:], ni.HardwareAddr[:6])
+		log.Printf("bpf/darwin: bound %s mac=%s (loop guard active)", ifaceName, ni.HardwareAddr)
+	} else {
+		log.Printf("bpf/darwin: WARNING: could not read %s hardware address (%v) — "+
+			"loop guard cannot whitelist host-originated frames", ifaceName, err)
+	}
+	return b, nil
 }
 
 // openBPFDevice finds and opens the first available /dev/bpfN device.
@@ -185,6 +219,57 @@ func (b *darwinBPF) dedupSeen(frame []byte) bool {
 	return ok && time.Since(t) < bpfDedupTTL
 }
 
+// hubMACRecord notes the source MAC of a frame injected from the hub, marking
+// that station as living behind the hub rather than on the local segment.
+func (b *darwinBPF) hubMACRecord(frame []byte) {
+	if len(frame) < 12 {
+		return
+	}
+	var src [6]byte
+	copy(src[:], frame[6:12])
+	if src == b.localMAC {
+		// The hub echoed a frame sourced from our own NIC — that is a loop on the
+		// far side, not a hub-side station. Never block our own MAC.
+		return
+	}
+	now := time.Now()
+	b.hubMu.Lock()
+	b.hubMACs[src] = now
+	if now.Sub(b.lastHubSweep) > hubSweepInterval {
+		for k, t := range b.hubMACs {
+			if now.Sub(t) > hubMACTTL {
+				delete(b.hubMACs, k)
+			}
+		}
+		b.lastHubSweep = now
+	}
+	b.hubMu.Unlock()
+}
+
+// loopSeen reports whether a frame read from the NIC is our own injection
+// echoing back. A frame whose SOURCE MAC belongs to a station we have been
+// injecting from the hub cannot have originated on the local segment, so it must
+// be an echo — regardless of whether its bytes still hash-match what we wrote
+// (hardware padding, FCS, and delivery delay all break byte-exact matching).
+//
+// Forwarding such an echo to the hub is what makes the remote machine "appear
+// for a moment and then vanish": the hub relearns that MAC behind THIS session,
+// and unicast traffic for it is then black-holed into the local segment.
+func (b *darwinBPF) loopSeen(frame []byte) bool {
+	if len(frame) < 12 {
+		return false
+	}
+	var src [6]byte
+	copy(src[:], frame[6:12])
+	if src == b.localMAC {
+		return false // host-originated: must reach the hub
+	}
+	b.hubMu.Lock()
+	t, ok := b.hubMACs[src]
+	b.hubMu.Unlock()
+	return ok && time.Since(t) < hubMACTTL
+}
+
 // ReadFrame returns one Ethernet frame. Blocks until a frame arrives or ctx
 // is cancelled. Multiple frames from one BPF read are queued internally.
 func (b *darwinBPF) ReadFrame(ctx context.Context) ([]byte, error) {
@@ -197,6 +282,18 @@ func (b *darwinBPF) ReadFrame(ctx context.Context) ([]byte, error) {
 				n := b.dedupDrops.Add(1)
 				if n <= 10 || n%100 == 0 {
 					log.Printf("bpf/darwin: dedup drop #%d src=%s dst=%s len=%d",
+						n, fmtMACSlice(f[6:12]), fmtMACSlice(f[0:6]), len(f))
+				}
+				continue
+			}
+			// Byte-exact dedup missed it (padding/FCS/timing) — fall back to the
+			// source-MAC loop guard, which does not depend on the bytes surviving
+			// the round trip intact.
+			if b.loopSeen(f) {
+				n := b.loopDrops.Add(1)
+				if n <= 10 || n%100 == 0 {
+					log.Printf("bpf/darwin: loop drop #%d src=%s dst=%s len=%d "+
+						"(hub-side MAC seen on local segment — echo suppressed)",
 						n, fmtMACSlice(f[6:12]), fmtMACSlice(f[0:6]), len(f))
 				}
 				continue
@@ -242,6 +339,7 @@ func (b *darwinBPF) WriteFrame(frame []byte) error {
 		return nil
 	}
 	b.dedupRecord(frame)
+	b.hubMACRecord(frame)
 	_, err := unix.Write(b.fd, frame)
 	return err
 }

@@ -14,6 +14,7 @@ package hub
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -35,6 +36,10 @@ type Hub struct {
 	name     string
 	clients  map[uint32]*Client // sessionID → client
 	macTable map[[6]byte]macEntry
+	// MAC-flap diagnostics: a MAC repeatedly changing session indicates a client
+	// looping frames back into the hub. Guarded by mu.
+	lastFlapLog time.Time
+	flapCount   uint64
 }
 
 type macEntry struct {
@@ -95,9 +100,31 @@ func (h *Hub) Forward(srcSession uint32, frame []byte) {
 	dstEntry, known := h.macTable[dst]
 	h.mu.RUnlock()
 
+	// A MAC that keeps moving between sessions means some client is echoing frames
+	// back into the hub (an L2 loop). The symptom is a station that appears for an
+	// instant and then goes unreachable, because unicast for it follows the wrong
+	// session. Log it — rate-limited — so the culprit session is identifiable.
+	moved := srcKnown && srcEntry.sessionID != srcSession
+
 	needUpdate := !srcKnown ||
 		srcEntry.sessionID != srcSession ||
 		time.Until(srcEntry.expires) < time.Minute
+
+	if moved {
+		h.mu.Lock()
+		shouldLog := time.Since(h.lastFlapLog) > 5*time.Second
+		if shouldLog {
+			h.lastFlapLog = time.Now()
+		}
+		h.flapCount++
+		n := h.flapCount
+		h.mu.Unlock()
+		if shouldLog {
+			log.Printf("hub%d: MAC %s moved session %d → %d (flap #%d) — "+
+				"a client is likely looping frames back into the hub",
+				h.id, fmtMAC(src), srcEntry.sessionID, srcSession, n)
+		}
+	}
 
 	if needUpdate {
 		// Slow path: write lock to update src MAC entry.

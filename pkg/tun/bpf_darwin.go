@@ -13,6 +13,8 @@
 // Setup sequence:
 //   open /dev/bpfN  → BIOCSETIF (bind NIC) → BIOCIMMEDIATE → BIOCPROMISC
 //   → BIOCSRTIMEOUT (100 ms read timeout for ctx cancellation)
+//   → BIOCSHDRCMPLT=1 (inject frames with the source MAC we supply — without
+//     this the kernel rewrites it to the NIC's own MAC and bridging breaks)
 //   → BIOCSSEESENT=1 (capture self-sent frames so Mac host traffic reaches hub)
 //   → BIOCGBLEN (get read buffer size)
 //
@@ -121,9 +123,30 @@ func openBPF(ifaceName string) (*darwinBPF, error) {
 		return nil, fmt.Errorf("bpf/darwin: BIOCSRTIMEOUT: %w", errno)
 	}
 
+	// "Header complete": write the link-level header EXACTLY as we supply it.
+	//
+	// This flag is initialized to ZERO by default, and at zero the interface
+	// output routine overwrites the source MAC of every injected frame with this
+	// NIC's own address. For an L2 bridge that is fatal: a frame relayed from a
+	// remote station reaches the local segment appearing to come from the Mac, so
+	// the local machine addresses its replies to the Mac's MAC. Those replies then
+	// arrive at the hub with the Mac's own MAC as destination, the hub resolves
+	// that to this very session and drops it as a self-loop — the peer is briefly
+	// visible (its broadcasts still carry a correct source) but no traffic ever
+	// completes. Setting it to one preserves true L2 transparency; it is also what
+	// libpcap does for packet injection.
+	hdrComplete := uint32(1)
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
+		uintptr(fd), unix.BIOCSHDRCMPLT, uintptr(unsafe.Pointer(&hdrComplete))); errno != 0 {
+		unix.Close(fd)
+		return nil, fmt.Errorf("bpf/darwin: BIOCSHDRCMPLT: %w", errno)
+	}
+
 	// Capture self-sent frames so the Mac host's own traffic (pings, ARP,
 	// ZGW probes) is forwarded to the hub in bridge mode.
-	// Frames we inject via WriteFrame are excluded by the software dedup.
+	// Frames we inject via WriteFrame are excluded by the dedup + loop guard,
+	// both of which depend on the source MAC surviving injection unmodified —
+	// i.e. on BIOCSHDRCMPLT above.
 	one2 := uint32(1)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), unix.BIOCSSEESENT, uintptr(unsafe.Pointer(&one2))); errno != 0 {

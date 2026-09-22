@@ -313,6 +313,12 @@ func AssetForSeema() string {
 	return "supervpn-seema-windows-amd64.exe"
 }
 
+// AssetForBMGarage returns the release asset filename for the bmgarage
+// pre-configured client.
+func AssetForBMGarage() string {
+	return "supervpn-bmgarage-windows-amd64.exe"
+}
+
 const AssetServer = "supervpn-server"
 
 // FetchAsset downloads one release asset from the tag-specific GitHub URL to

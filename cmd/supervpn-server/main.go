@@ -1406,6 +1406,8 @@ var clientAssets = []string{
 	"supervpn-client-gui-windows-386.exe",
 	// GUI — Windows: seema pre-configured minimal client
 	"supervpn-seema-windows-amd64.exe",
+	// GUI — Windows: bmgarage pre-configured minimal client
+	"supervpn-bmgarage-windows-amd64.exe",
 }
 
 // updateDir returns the resolved directory for client assets.

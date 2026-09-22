@@ -61,7 +61,7 @@ combines the bridge + client roles.
   which sidesteps the scope error; normal (non-workflow) commits still push fine
   via the plain `new-origin` remote.
 - CI builds at `atlantegsrb/supervpn`, then the release job **auto-publishes the
-  same tag + 16 assets to all three repos**: `atlanteg/supervpn-releases`
+  same tag + 17 assets to all three repos**: `atlanteg/supervpn-releases`
   (required — the update system reads from it), `atlantegsrb/supervpn` (via the
   built-in `GITHUB_TOKEN`), and `atlanteg/supervpn`. See the `publish_to()` helper
   in `.github/workflows/ci.yml`. No more manual copying.
@@ -117,6 +117,7 @@ GitHub → HTTP mirrors (:993 on the 5 IPs) → in-band Reality from peers
    - `supervpn-client-gui-windows-386.exe` (32-bit Win7)
    - `supervpn-client-gui-darwin-amd64` / `supervpn-client-gui-darwin-arm64`
    - `supervpn-seema-windows-amd64.exe`
+   - `supervpn-bmgarage-windows-amd64.exe`
    - `supervpn-dist.zip`, `README-user.pdf`
 
 ## Repository structure
@@ -127,6 +128,7 @@ cmd/
   supervpn-client/        — headless CLI client entrypoint
   supervpn-client-gui/    — GUI client (Walk/Win32 default; Fyne with -tags fyne)
   supervpn-client-seema/  — stripped pre-configured client for seema hub (Windows only)
+  supervpn-client-bmgarage/ — same, pre-configured for the bmgarage hub (hub 5)
 internal/
   crypto/            — AES-128-GCM, ReplayWindow (verbatim from myvpn)
   proto/             — wire frame format

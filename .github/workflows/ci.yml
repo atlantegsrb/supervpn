@@ -67,7 +67,7 @@ jobs:
 
           # GUI (Walk + macOS Fyne + seema) trigger gui jobs
           if echo "$CHANGED" | grep -qE \
-            '^(cmd/supervpn-client-gui/|cmd/supervpn-client-seema/|internal/|pkg/|go\.(mod|sum))'; then
+            '^(cmd/supervpn-client-gui/|cmd/supervpn-client-seema/|cmd/supervpn-client-bmgarage/|internal/|pkg/|go\.(mod|sum))'; then
             gui=true
           fi
 
@@ -402,6 +402,24 @@ jobs:
             -o dist/supervpn-seema-windows-amd64.exe `
             ./cmd/supervpn-client-seema
 
+      - name: Build bmgarage client (windows/amd64)
+        shell: pwsh
+        run: |
+          $icon = "cmd\supervpn-client-bmgarage\icon.ico"
+          Write-Host "bmgarage icon: $icon ($((Get-Item $icon).Length) bytes)"
+          Push-Location cmd\supervpn-client-bmgarage
+          go-winres simply --icon icon.ico --manifest gui --arch amd64
+          Pop-Location
+          Write-Host "bmgarage syso: $((Get-Item 'cmd\supervpn-client-bmgarage\rsrc_windows_amd64.syso').Length) bytes"
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $VER = "${{ needs.setup.outputs.ver }}"
+          go build `
+            -ldflags="-s -w -H windowsgui -X main.version=$VER" `
+            -o dist/supervpn-bmgarage-windows-amd64.exe `
+            ./cmd/supervpn-client-bmgarage
+
       - name: Build GUI client Walk (windows/386 — 32-bit Win7)
         shell: pwsh
         run: |
@@ -530,6 +548,7 @@ jobs:
             fill "supervpn-client-gui-windows-amd64.exe"
             fill "supervpn-client-gui-windows-386.exe"
             fill "supervpn-seema-windows-amd64.exe"
+            fill "supervpn-bmgarage-windows-amd64.exe"
           fi
 
       - name: Fix permissions on unix executables
@@ -573,7 +592,8 @@ jobs:
             dist/supervpn-client-linux-amd64 dist/supervpn-client-linux-arm64 \
             dist/supervpn-client-gui-windows-amd64.exe dist/supervpn-client-gui-windows-386.exe \
             dist/supervpn-client-gui-darwin-amd64 dist/supervpn-client-gui-darwin-arm64 \
-            dist/superVPN-macos.zip dist/supervpn-seema-windows-amd64.exe dist/README-user.pdf; do
+            dist/superVPN-macos.zip dist/supervpn-seema-windows-amd64.exe \
+            dist/supervpn-bmgarage-windows-amd64.exe dist/README-user.pdf; do
             if [ -f "$f" ]; then FILES+=("$f"); else echo "::warning::Asset not found, skipping: $f"; fi
           done
           WANT=${#FILES[@]}
